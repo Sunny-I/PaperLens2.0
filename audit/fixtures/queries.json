@@ -1,0 +1,24 @@
+[
+  {
+    "query": "Orion accuracy test samples",
+    "relevant": [
+      {
+        "filename": "orion.pdf",
+        "page": 2
+      }
+    ]
+  },
+  {
+    "query": "Lyra moving average filter",
+    "relevant": [
+      {
+        "filename": "lyra.pdf",
+        "page": 1
+      }
+    ]
+  },
+  {
+    "query": "xylophonexyzzy",
+    "relevant": []
+  }
+]

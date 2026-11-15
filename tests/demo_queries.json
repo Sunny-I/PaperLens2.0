@@ -1,0 +1,6 @@
+[
+  {"query": "Transformer self-attention architecture", "relevant": [{"filename": "Attention_Is_All_You_Need.pdf", "page": 3}]},
+  {"query": "residual learning image recognition", "relevant": [{"filename": "Deep_Residual_Learning_ResNet.pdf"}]},
+  {"query": "retrieval augmented generation", "relevant": [{"filename": "Retrieval_Augmented_Generation_NLP.pdf"}]},
+  {"query": "xyzzyqwertyunknown", "relevant": []}
+]
