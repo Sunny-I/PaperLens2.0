@@ -1,5 +1,9 @@
 # PaperLens
 
+Want to learn and explain the project in an interview? Start with the
+**[simple learning notes](notes/START_HERE.md)**, including the actual data flows,
+authentication/session explanations, 130 interview questions, and a revision sheet.
+
 ## Persistent hosted workspace
 
 The default app now uses **Google login, PostgreSQL projects and chat, private

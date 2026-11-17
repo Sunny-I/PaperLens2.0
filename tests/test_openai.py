@@ -128,6 +128,16 @@ class OpenAITests(unittest.TestCase):
             "pages": [{"page": 1, "text": quote}]}, OpenAIClient("fake"), "test")
         self.assertEqual(result.mode, "generated")
 
+    def test_summary_reference_schema_is_parsed_by_sdk(self):
+        quote = 'The RAG method improves efﬁciency in the study by ¸Sakar.'
+        self.transport(lambda request: self.response({'research_problem': None,
+            'methodology': {'text': 'Improves RAG efficiency.', 'evidence': [{'page': 1, 'evidence_id': 1}]},
+            'datasets_and_benchmarks': None, 'key_findings': [], 'limitations': []}))
+        result = PaperSummarizer().summarize({'filename': 'test.pdf', 'raw_text': quote,
+            'pages': [{'page': 1, 'text': quote}]}, OpenAIClient('fake'), 'test', evidence_ids=True)
+        self.assertEqual(result.mode, 'generated')
+        self.assertEqual(result.summary.evidence['methodology'][0].quote, quote)
+
     def test_key_precedence_and_validation(self):
         self.assertEqual(resolve_openai_key({"OPENAI_API_KEY": "secret"},
                                            {"OPENAI_API_KEY": " env "}), "env")

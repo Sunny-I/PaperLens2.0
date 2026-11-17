@@ -198,7 +198,7 @@ class WorkspaceService:
         if record['status'] != 'ready':
             raise ValueError('Wait until this file is ready before summarizing it.')
         result = PaperSummarizer().summarize(record['paper'], self.chat_client(),
-                                           os.getenv('OPENAI_CHAT_MODEL', 'gpt-4.1-mini'))
+                                           os.getenv('OPENAI_CHAT_MODEL', 'gpt-4.1-mini'), evidence_ids=True)
         saved = {'summary': result.summary.model_dump(), 'mode': result.mode,
                  'warning': result.warning, 'model': result.model}
         if result.mode != 'generated' and record['summary'] and record['summary']['mode'] == 'generated':

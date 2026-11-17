@@ -106,8 +106,8 @@ public launch until usage and provider quotas are monitored.
 Exact quote checks verify provenance, not whether a claim logically follows from
 the quote. Validate important interpretations against the original paper.
 
-The project chat uses numbered evidence passages: the model selects source and
-passage IDs, and the server attaches the original source quote. This avoids PDF
+Project chat and paper summaries use numbered evidence passages: the model selects
+source/page and passage IDs, and the server attaches the original source quote. This avoids PDF
 accent/ligature transcription errors while rejecting unknown references. Author
 and title questions use the saved first two physical pages rather than semantic
 bibliography matches. Older saved answers are retained; ask again to use the new
