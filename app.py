@@ -1,340 +1,256 @@
-"""PaperLens: research evidence search and optional local RAG."""
-import os
+"""PaperLens: private projects, persistent PDFs and cited research chat."""
 import json
-import time
-from dataclasses import replace as copy_corpus
-
-import pandas as pd
+import os
 import streamlit as st
+from sqlalchemy.exc import SQLAlchemyError
+from workspace.settings import load_environment, missing_configuration, integer
+from workspace.database import Repository
+from workspace.service import WorkspaceService
+from workspace.ui import apply_workspace_style, display_name
 
-from pipeline.demo_papers import load_demo_papers
-from pipeline.voyage_client import VoyageClient, EMBEDDING_MODELS
-from pipeline.configuration import resolve_api_key
-from pipeline.answer_generator import AnswerGenerator
-from pipeline.corpus import Corpus, ingest, summarize_corpus
-from pipeline.ollama_client import OllamaClient
-from pipeline.openai_client import OpenAIClient, DEFAULT_OPENAI_MODEL, resolve_openai_key
-from pipeline.gemini_client import GeminiClient, ProviderEmbeddings, DEFAULT_CHAT_MODEL, validate_chat_model
-
-st.set_page_config(page_title="PaperLens", page_icon="📄", layout="wide")
-st.title("📄 PaperLens")
-st.caption("Search research PDFs, inspect source excerpts, and generate answers with citations.")
-if "corpus" not in st.session_state:
-    st.session_state.corpus = Corpus()
+load_environment()
+st.set_page_config(page_title='PaperLens', page_icon='📄', layout='wide')
+apply_workspace_style()
 
 
-def persistent_text(label, name, default, **kwargs):
-    """Store settings independently from conditional Streamlit widget lifetimes."""
-    saved = st.session_state.setdefault("saved_settings", {})
-    saved.setdefault(name, st.session_state.get(name, default))
-    widget_key = f"_setting_{name}"
-    if widget_key not in st.session_state:
-        st.session_state[widget_key] = saved[name]
-    def remember():
-        saved[name] = st.session_state[widget_key]
-    value = st.text_input(label, key=widget_key, on_change=remember, **kwargs)
-    saved[name] = value
-    return value
-
-def persistent_choice(label, name, options):
-    saved = st.session_state.setdefault("saved_settings", {})
-    default = os.getenv(name.upper().replace("_EMBEDDING_MODEL", "_EMBED_MODEL"), options[0])
-    saved.setdefault(name, st.session_state.get(name, default))
-    choices = list(options)
-    if saved[name] not in choices:
-        choices.append(saved[name])  # Keep explicit legacy/env selections reviewable.
-    key = f"_choice_{name}"
-    if key not in st.session_state:
-        st.session_state[key] = saved[name]
-    def remember():
-        saved[name] = st.session_state[key]
-    value = st.selectbox(label, choices, key=key, on_change=remember)
-    saved[name] = value
-    return value
+@st.cache_resource
+def repository():
+    repo = Repository()
+    repo.initialize()
+    return repo
 
 
-with st.sidebar:
-    st.header("Your papers")
-    uploads = st.file_uploader("Upload papers", type=["pdf"], accept_multiple_files=True,
-                               key=f"uploads_{st.session_state.get('upload_version', 0)}")
-    replace = st.checkbox("Start a new collection", value=False,
-                          help="When you analyze new uploads, they replace the current collection.")
-    generate_summaries = st.checkbox("Summarize on upload", value=False)
-    # From above to her only received the files 
-    with st.expander("Settings", expanded=False):
-        st.caption("Choose embeddings independently from the provider used for answers and summaries.")
-        provider = st.selectbox("Model provider", ["Gemini", "OpenAI", "Ollama"],
-                                help="Used for AI answers and summaries. Embeddings have a separate provider below.")
-        generate = st.checkbox("Generate AI answers", value=True,
-                               help="Turn off to display matching source excerpts without generating an answer.")
-        retrieval = st.selectbox("Search method for new uploads", ["TF-IDF keywords (offline)", "Semantic embeddings"])
-        base_url = "http://localhost:11434"
-        if provider == "Ollama":
-            base_url = persistent_text("Ollama server URL", "OLLAMA_BASE_URL", os.getenv("OLLAMA_BASE_URL", base_url))
-        elif provider == "OpenAI":
-            st.caption("Configure OPENAI_API_KEY in the environment or .streamlit/secrets.toml. Keys are never displayed.")
+def report_error(exc):
+    if isinstance(exc, ValueError):
+        st.error(str(exc))
+    elif isinstance(exc, SQLAlchemyError):
+        st.error('Database operation failed. Check the PostgreSQL connection and try again.')
+    else:
+        st.error('The operation could not finish. Check server configuration and try again.')
+
+
+def render_answer(payload, service, owner, project_id, key):
+    result = payload['result']
+    st.caption('AI answer · sources checked' if result['mode'] == 'generated' else 'Source evidence')
+    st.write(result['text'])
+    if result.get('warning'):
+        warning = result['warning']
+        if 'validation' in warning.lower():
+            st.warning('The AI answer could not pass source checks. Read the matching passages below, or ask again.')
+            with st.expander('Why this answer fell back to sources'):
+                st.caption(warning.replace(' Showing source excerpts instead.', '').strip())
         else:
-            st.caption("Configure GEMINI_API_KEY in the environment or .streamlit/secrets.toml. Keys are never displayed.")
-        embedding_provider = "Voyage AI"
-        embedding_model = ""
-        if retrieval == "Semantic embeddings":
-            embedding_provider = persistent_choice("Embedding provider", "embedding_provider", list(EMBEDDING_MODELS))
-            prefix = "Voyage" if embedding_provider == "Voyage AI" else embedding_provider
-            embedding_model = persistent_choice("Embedding model", f"{prefix}_embedding_model", EMBEDDING_MODELS[embedding_provider])
-            st.caption("Voyage AI uses VOYAGE_API_KEY; Gemini uses GEMINI_API_KEY. Configure keys in .streamlit/secrets.toml or your environment.")
-            if embedding_provider == "Ollama" and provider != "Ollama":
-                base_url = persistent_text("Ollama server URL", "OLLAMA_BASE_URL", os.getenv("OLLAMA_BASE_URL", base_url))
-        chat_model = persistent_text("Chat model", f"{provider}_chat_model", os.getenv(f"{provider.upper()}_CHAT_MODEL", DEFAULT_OPENAI_MODEL if provider == "OpenAI" else DEFAULT_CHAT_MODEL if provider == "Gemini" else ""),
-                                  help="Use a chat model for answers and summaries, not an embedding model.")
-        if provider == "Gemini" and chat_model.strip():
-            try:
-                validate_chat_model(chat_model)
-            except ValueError as exc:
-                st.error(str(exc))
-        threshold = st.slider("Minimum cosine similarity", 0.0, 1.0,
-                              0.05, 0.01, key="retrieval_min_score")
-        if st.session_state.corpus.papers:
-            requested = "TF-IDF keyword retrieval" if retrieval == "TF-IDF keywords (offline)" else f"{embedding_provider} semantic embeddings: {embedding_model.strip()}"
-            if requested != st.session_state.corpus.retrieval_label:
-                st.info(f"Current papers still use {st.session_state.corpus.retrieval_label}. Analyze papers to apply the new search settings.")
-        st.caption("Advanced relevance filter. Higher values can exclude useful evidence; this is not a confidence score.")
-    st.caption("Paper text goes to the selected embedding provider. Answer and summary requests go to the chat provider. API quotas and charges may apply.")
-
-    def get_client(selected_provider=None):
-        selected_provider = selected_provider or provider
-        if selected_provider == "OpenAI":
-            if "OPENAI_API_KEY" in os.environ:
-                return OpenAIClient(resolve_openai_key(environ=os.environ))
-            try:
-                return OpenAIClient(resolve_openai_key(st.secrets, environ={}))
-            except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
-                raise ValueError("Set OPENAI_API_KEY in your environment or Streamlit secrets before using OpenAI.") from None
-        if selected_provider == "Voyage AI":
-            if "VOYAGE_API_KEY" in os.environ:
-                key = os.environ["VOYAGE_API_KEY"]
-            else:
+            st.warning(warning)
+    if result['mode'] == 'extractive':
+        st.caption(f"{len(payload['hits'])} matching passages. Expand a source below to read it.")
+    else:
+        for claim in result['claims']:
+            st.write(claim['text'])
+            labels = []
+            for source_id in sorted({c['source_id'] for c in claim['citations']}):
+                if 1 <= source_id <= len(payload['hits']):
+                    source = payload['hits'][source_id - 1]
+                    labels.append(f"[{source_id}] {source['filename']} · page {source['page']}")
+            st.caption('Sources: ' + '  |  '.join(labels))
+    for index, hit in enumerate(payload['hits'], 1):
+        with st.expander(f"[{index}] {hit['filename']} · page {hit['page']}"):
+            quotes = list(dict.fromkeys(c['quote'] for claim in result['claims']
+                for c in claim['citations'] if c['source_id'] == index))
+            st.text('\n\n'.join(quotes) if quotes else hit['text'])
+            if st.button('Open original PDF', key=f'source-{key}-{index}'):
                 try:
-                    key = st.secrets.get("VOYAGE_API_KEY", "")
-                except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
-                    key = ""
-            return VoyageClient(key)
-        if selected_provider == "Ollama":
-            return OllamaClient(base_url)
-        if "GEMINI_API_KEY" in os.environ or "GOOGLE_API_KEY" in os.environ:
-            api_key, key_source = resolve_api_key(environ=os.environ)
-        else:
-            try:
-                secret_values = st.secrets
-                api_key, key_source = resolve_api_key(secret_values, environ={})
-            except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
-                raise ValueError("Set GEMINI_API_KEY in your environment or Streamlit secrets before using Gemini.") from None
-        st.session_state.credential_source = key_source
-        return GeminiClient(api_key)
+                    st.link_button('View PDF at this page', service.source_url(owner, project_id,
+                        hit['doc_id'], hit['page']))
+                except ValueError as exc:
+                    st.info(str(exc))
+    if result['mode'] == 'generated':
+        st.caption('Citations verify where quotes came from. Review the source to confirm the interpretation.')
 
-    process = st.button("Analyze papers", type="primary", disabled=not uploads)
-    samples = st.button("Try sample papers")
-    st.caption("Loads the PDFs from your sample_papers folder.")
-    if st.session_state.corpus.papers and st.button("Clear library"):
-        st.session_state.confirm_clear = True
-    if st.session_state.get("confirm_clear"):
-        st.warning("Remove all papers, summaries, and answers from this session?")
-        confirm, cancel = st.columns(2)
-        if confirm.button("Yes, clear library", type="primary"):
-            st.session_state.corpus = Corpus()
-            st.session_state.pop("last_answer", None)
-            st.session_state.confirm_clear = False
-            st.session_state.upload_version = st.session_state.get("upload_version", 0) + 1
-            st.rerun()
-        if cancel.button("Cancel"):
-            st.session_state.confirm_clear = False
-            st.rerun()
-    if process or samples:
-        try:
-            if generate_summaries and not chat_model.strip():
-                raise ValueError("Enter a chat model to generate summaries.")
-            client = get_client() if generate_summaries else None
-            embedder = None
-            label = "TF-IDF keyword retrieval"
-            if retrieval == "Semantic embeddings":
-                if not embedding_model.strip():
-                    raise ValueError("Enter an embedding model before indexing.")
-                # Freeze settings for this index, including subsequent query embeddings.
-                model_name = embedding_model.strip()
-                embedder = ProviderEmbeddings(get_client(embedding_provider), model_name)
-                label = f"{embedding_provider} semantic embeddings: {model_name}"
-            files = load_demo_papers() if samples else [(f.name, f.getvalue()) for f in uploads]
-            previous = st.session_state.corpus
-            if samples:
-                # Remove only the generated examples from the earlier demo implementation.
-                legacy = {key for key, paper in previous.papers.items()
-                          if paper["filename"] in {"Sample_Study_A.pdf", "Sample_Study_B.pdf"}
-                          and "FICTIONAL EXAMPLE - not a published research paper." in paper["raw_text"]}
-                previous = copy_corpus(previous,
-                    papers={k: v for k, v in previous.papers.items() if k not in legacy},
-                    summaries={k: v for k, v in previous.summaries.items() if k not in legacy},
-                    summary_results={k: v for k, v in previous.summary_results.items() if k not in legacy})
-            with st.spinner("Analyzing your papers…"):
-                corpus = ingest(files, previous, replace, embedder, label)
-            if generate_summaries:
-                with st.spinner("Generating page-cited structured summaries…"):
-                    corpus = summarize_corpus(corpus, client, chat_model.strip())
-            st.session_state.corpus = corpus
-            st.session_state.pop("last_answer", None)
-            st.success(f"Your collection is ready: {len(corpus.papers)} papers.")
-            st.session_state.confirm_clear = False
-        except (ValueError, OSError) as exc:
-            st.error(f"Library update failed: {exc} Your previous library is unchanged.")
-    corpus = st.session_state.corpus
-    st.divider()
-    st.caption(f"{len(corpus.papers)} papers in your collection")
-    for paper in corpus.papers.values():
-        st.write(paper["filename"])
-        st.caption(f"{paper['total_pages']} pages")
 
-corpus = st.session_state.corpus
-if not corpus.papers:
-    st.info("Upload your research papers, then choose Analyze papers. Or try the sample collection. Scanned PDFs need text recognition before upload.")
+missing = missing_configuration()
+if missing:
+    st.title('📄 PaperLens')
+    st.subheader('Your research workspace is almost ready')
+    st.write('Fill in the local .env file, then restart with the command below.')
+    st.code('.venv\\Scripts\\python scripts/run.py', language='powershell')
+    st.write('Missing settings:')
+    st.code('\n'.join(missing), language=None)
+    st.caption('Credentials stay on the server. Do not paste them into chat.')
     st.stop()
 
-def paper_label(key):
-    name = corpus.papers[key]["filename"]
-    duplicate = sum(p["filename"] == name for p in corpus.papers.values()) > 1
-    return f"{name} ({key[:8]})" if duplicate else name
+if not st.user.is_logged_in:
+    st.title('📄 PaperLens')
+    st.header('Your papers. Clearer answers.')
+    st.write('Create a research project, add your PDFs, and explore answers backed by the original sources.')
+    st.button('Continue with Google', type='primary', on_click=st.login)
+    st.caption('Your projects, papers, and conversations are private to your account.')
+    st.stop()
 
+subject = st.user.get('sub')
+if not subject:
+    st.error('Google did not return a valid account identity. Sign out and try again.')
+    st.button('Sign out', on_click=st.logout)
+    st.stop()
 
-qa, summaries = st.tabs(["Ask your papers", "Paper summaries"])
-with qa:
-    st.caption("Ask for an explanation, compare methods, or explore findings. Answers include supporting sources.")
-    scope = st.radio("Search in", ["All papers", "Selected papers"], horizontal=True)
-    selected_papers = []
-    if scope == "Selected papers":
-        selected_papers = st.multiselect("Choose papers", list(corpus.papers), format_func=paper_label)
-    with st.form("research_question"):
-        question = st.text_input("Research question", placeholder="What are the main findings, and how do the methods compare?")
-        submitted = st.form_submit_button("Ask", type="primary")
-    if submitted:
-        st.session_state.pop("last_answer", None)
-        if scope == "Selected papers" and not selected_papers:
-            st.warning("Choose at least one paper, or switch to All papers.")
-        elif not question.strip():
-            st.warning("Enter a research question.")
-        elif generate and not chat_model.strip():
-            st.error("Enter a chat model, or turn off answer generation.")
-        else:
+try:
+    repo = repository()
+    user = repo.user(subject, st.user.get('email', ''), st.user.get('name', 'Researcher'))
+    service = WorkspaceService(repo)
+    project_list = repo.list_projects(user['id'])
+except Exception as exc:
+    report_error(exc)
+    st.stop()
+
+owner = user['id']
+with st.sidebar:
+    st.title('📄 PaperLens')
+    st.caption(f"Signed in as {display_name(user)}")
+    st.button('Sign out', on_click=st.logout, use_container_width=True)
+    st.divider()
+    st.subheader('My projects')
+    with st.form('new-project', clear_on_submit=True):
+        name = st.text_input('Project name', max_chars=120, placeholder='e.g. Medical image analysis')
+        if st.form_submit_button('＋ Create project', use_container_width=True):
             try:
-                started = time.perf_counter()
-                with st.spinner("Finding evidence and preparing the answer…"):
-                    hits, latency = corpus.store.search(question, min_score=threshold,
-                        doc_ids=selected_papers or None)
-                    result = AnswerGenerator().answer(question, hits,
-                        get_client() if generate else None, chat_model.strip() if generate else None)
-                st.session_state.last_answer = {"question": question, "hits": hits, "result": result,
-                    "doc_ids": selected_papers or list(corpus.papers),
-                    "configuration": {"provider": provider if generate else None, "chat_model": chat_model.strip() if generate else None,
-                                      "retrieval": corpus.retrieval_label, "min_score": threshold, "top_k": 6},
-                    "retrieval_ms": latency, "total_seconds": round(time.perf_counter() - started, 3)}
-            except ValueError as exc:
-                st.error(str(exc))
-    if "last_answer" in st.session_state:
-        saved = st.session_state.last_answer
-        result, hits = saved["result"], saved["hits"]
-        st.download_button("Download answer and citations", json.dumps(saved, indent=2),
-                           file_name="paperlens-answer.json", mime="application/json")
-        st.subheader(saved["question"])
-        st.caption("AI answer with sources" if result["mode"] == "generated" else "Source excerpts" if result["mode"] == "extractive" else "No supporting evidence found")
-        if result["warning"]:
-            st.warning(result["warning"])
-        st.write(result["text"])
-        for claim in result["claims"]:
-            ids = sorted({c["source_id"] for c in claim["citations"]})
-            st.write(claim["text"])
-            st.caption("Sources: " + ", ".join(f"[{i}]" for i in ids))
-            if result["mode"] == "generated":
-                for citation in claim["citations"]:
-                    st.text(f"[{citation['source_id']}] {citation['quote']}")
-        if result["mode"] == "generated":
-            st.caption("Source IDs and quoted text are checked automatically. Verify that each quote supports its claim.")
-        if hits:
-            st.subheader("Evidence by paper")
-            rows = []
-            for doc_id, paper in corpus.papers.items():
-                if doc_id not in saved["doc_ids"]:
-                    continue
-                paper_hits = [(i, h) for i, h in enumerate(hits, 1) if h["doc_id"] == doc_id]
-                rows.append({"Paper": paper_label(doc_id),
-                             "Evidence for this question": "\n\n".join(f"[{i}] p. {h['page']}: {h['text']}" for i, h in paper_hits)
-                             or "No retrieved evidence above the threshold."})
-            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
-        for i, hit in enumerate(hits, 1):
-            with st.expander(f"[{i}] {paper_label(hit['doc_id'])} · page {hit['page']}"):
-                st.text(hit["text"])
+                project_id = repo.create_project(owner, name,
+                    os.getenv('OPENAI_EMBED_MODEL', 'text-embedding-3-small'), integer('OPENAI_EMBED_DIMENSIONS', 1536))
+                st.session_state['active_project'] = project_id
+                st.rerun()
+            except Exception as exc:
+                report_error(exc)
+    ids = [p['id'] for p in project_list]
+    labels = {p['id']: p['name'] for p in project_list}
+    if ids:
+        if st.session_state.get('active_project') not in ids:
+            st.session_state['active_project'] = ids[0]
+        project_id = st.selectbox('Open project', ids, format_func=lambda key: labels[key], key='active_project')
+    st.divider()
+    st.caption('Your papers and conversations are saved automatically. Each project has its own research library.')
 
-with summaries:
-    st.caption("Review each paper’s research problem, methods, findings, and limitations, with supporting page references.")
-    selected = st.selectbox("Paper", list(corpus.papers), format_func=paper_label)
-    summary_one = st.button("Summarize this paper")
-    summary_all = st.button("Summarize all papers")
-    if summary_one or summary_all:
-        try:
-            if not chat_model.strip():
-                raise ValueError("Enter a chat model to generate summaries.")
-            with st.spinner("Reading paper batches and validating summaries…"):
-                corpus = summarize_corpus(corpus, get_client(), chat_model.strip(),
-                                          None if summary_all else [selected])
-            st.session_state.corpus = corpus
-        except ValueError as exc:
-            st.error(str(exc))
-    summary = corpus.summaries[selected]
-    summary_result = corpus.summary_results.get(selected)
-    if summary_result:
-        st.caption("AI-generated summary" if summary_result.mode == "generated" else "Source excerpts")
-        if summary_result.warning:
-            st.warning(summary_result.warning)
-    else:
-        st.info("These are source excerpts. Choose Summarize this paper for a concise AI summary.")
-    st.subheader(summary.title)
-    st.download_button("Download structured summary", summary.model_dump_json(indent=2),
-                       file_name=f"summary-{selected[:8]}.json", mime="application/json")
-    for field, label in [("research_problem", "Research problem"), ("methodology", "Methodology"),
-                         ("datasets_and_benchmarks", "Datasets / experiments"), ("key_findings", "Results / conclusions"),
-                         ("limitations", "Declared limitations")]:
-        st.markdown(f"**{label}**")
-        evidence = summary.evidence.get(field, [])
-        if not evidence:
-            st.write("Not found in the extracted text.")
-        value = getattr(summary, field)
-        if isinstance(value, list):
-            for item in value:
-                st.write(f"• {item}")
-        elif value:
-            st.write(value)
-        if evidence:
-            with st.expander(f"Supporting quotes: {label}"):
-                for item in evidence:
-                    st.text(item.quote)
-                    st.caption(f"Source: {corpus.papers[selected]['filename']}, page {item.page}")
-    st.subheader("Cross-paper summary comparison")
-    st.dataframe(pd.DataFrame([{
-        "Paper": paper_label(key),
-        "Summary type": "AI summary" if key in corpus.summary_results and corpus.summary_results[key].mode == "generated" else "Source excerpts",
-        "Problem": item.research_problem or "Not found",
-        "Methodology": item.methodology or "Not found",
-        "Findings": "\n".join(item.key_findings) or "Not found",
-        "Limitations": "\n".join(item.limitations) or "Not found",
-    } for key, item in corpus.summaries.items()]), width="stretch", hide_index=True)
+if not project_list:
+    st.title('A home for every research question')
+    st.write('Create your first project in the sidebar. Each project keeps its own papers, citations, and conversation.')
+    st.stop()
 
-with st.sidebar.expander("Developer diagnostics", expanded=False):
-    requested_retrieval = "TF-IDF keyword retrieval" if retrieval == "TF-IDF keywords (offline)" else f"{embedding_provider} semantic embeddings: {embedding_model.strip()}"
-    st.write(f"Active index: {corpus.retrieval_label}")
-    st.write(f"Requested search configuration: {requested_retrieval}")
-    if requested_retrieval != corpus.retrieval_label:
-        st.info("Search settings have changed. Analyze papers to rebuild the index. Until then, queries use the active index's original model.")
-    st.json({"current_chat_provider": provider, "current_chat_model": chat_model.strip(), "min_score": threshold,
-             "credential_source": st.session_state.get("credential_source", "not loaded")})
-    if "last_answer" in st.session_state:
-        st.json(st.session_state.last_answer.get("configuration", {}))
-    st.json(corpus.stats)
-    st.json({"papers": len(corpus.papers), "vectors": corpus.store.index.ntotal,
-             "dimensions": corpus.store.index.d, "index_type": "faiss.IndexFlatIP"})
-    st.write("Normalized vectors use inner-product search for cosine similarity. TF-IDF matches vocabulary; Provider embeddings provide model-based semantic retrieval.")
-    st.caption("Indexes are held in this session's memory. No benchmark or factual-accuracy guarantees are implied.")
+try:
+    project = repo.project(owner, project_id)
+    records = repo.list_files(owner, project_id)
+except Exception as exc:
+    report_error(exc)
+    st.stop()
+ready = [record for record in records if record['status'] == 'ready']
+st.title(project['name'])
+st.caption('A private collection of papers, evidence, and ideas.')
+c1, c2, c3 = st.columns(3)
+c1.metric('Papers ready', len(ready))
+c2.metric('Pages', sum(record['total_pages'] for record in ready))
+c3.metric('Searchable passages', sum(record['chunk_count'] for record in ready))
+files_tab, chat_tab, summary_tab = st.tabs(['Files', 'Chat', 'Summaries'])
+
+with files_tab:
+    st.subheader('Build your research library')
+    st.caption(f"Upload text-based PDFs up to {integer('MAX_FILE_MB', 20)} MB each. "
+               'Files are embedded once and stay available after refresh. Scanned PDFs need OCR first.')
+    upload_key = f"uploads-{project_id}-{st.session_state.get('upload_version', 0)}"
+    uploads = st.file_uploader('Add papers', type=['pdf'], accept_multiple_files=True, key=upload_key)
+    st.caption('Paper passages are sent to the configured embedding service and stored for search.')
+    if st.button('Upload and analyze', type='primary', disabled=not uploads):
+        progress = st.progress(0, text='Preparing PDFs…')
+        for index, upload in enumerate(uploads):
+            progress.progress(index / len(uploads), text=f'Processing {upload.name}…')
+            try:
+                service.upload(owner, project_id, upload.name, upload.getvalue())
+                st.success(f'{upload.name} is ready.')
+            except Exception as exc:
+                report_error(exc)
+        progress.progress(1.0, text='Processing finished')
+        st.session_state['upload_version'] = st.session_state.get('upload_version', 0) + 1
+        records = repo.list_files(owner, project_id)
+    if not records:
+        st.info('Add your first PDF to start exploring this project.')
+    for record in records:
+        with st.container(border=True):
+            left, right = st.columns([4, 1])
+            left.write(record['filename'])
+            left.caption(f"{record['status'].capitalize()} · {record['total_pages']} pages · "
+                         f"{record['size_bytes'] / 1024:.0f} KB")
+            if record['error']:
+                left.warning(record['error'])
+            if record['status'] == 'ready' and left.button('Open PDF', key='open-' + record['id']):
+                try:
+                    left.link_button('View original', service.source_url(owner, project_id, record['id']))
+                except Exception as exc:
+                    report_error(exc)
+            confirm = right.checkbox('Confirm removal', key='confirm-' + record['id'])
+            if right.button('Remove', key='remove-' + record['id'], disabled=not confirm):
+                try:
+                    service.remove_file(owner, project_id, record['id'])
+                    st.rerun()
+                except Exception as exc:
+                    report_error(exc)
+
+with chat_tab:
+    st.subheader('Ask your papers')
+    st.caption('Answers use evidence from this project. Earlier messages help interpret follow-up questions.')
+    ready = [r for r in records if r['status'] == 'ready']
+    selected = st.multiselect('Search specific papers (empty means all)',
+        [r['id'] for r in ready], format_func=lambda key: next(r['filename'] for r in ready if r['id'] == key),
+        key=f'scope-{project_id}')
+    generate = st.toggle('Write AI answers', value=True, key=f'generate-{project_id}',
+                         help='When off, embedding API calls still find original passages.')
+    try:
+        history = repo.history(owner, project_id, limit=100)
+        if not history:
+            st.info('Try “What problem do these papers address?” or “Compare their methods and limitations.”')
+        for message in history:
+            with st.chat_message(message['role']):
+                if message['role'] == 'user':
+                    st.write(message['content'])
+                else:
+                    render_answer(message['payload'], service, owner, project_id, message['id'])
+        if history:
+            st.download_button('Export displayed conversation', json.dumps(history, default=str, indent=2),
+                file_name=f'paperlens-{project_id}-chat.json', mime='application/json')
+        question = st.chat_input('Ask a question about this project…', disabled=not ready, max_chars=2000)
+        if question:
+            with st.spinner('Finding evidence and checking citations…'):
+                service.ask(owner, project_id, question, selected or None, generate)
+            st.rerun()
+    except Exception as exc:
+        report_error(exc)
+
+with summary_tab:
+    st.subheader('From long papers to clear findings')
+    if not ready:
+        st.info('Upload a paper before generating a summary.')
+    for record in ready:
+        with st.container(border=True):
+            st.write(record['filename'])
+            if st.button('Generate summary' if not record['summary'] else 'Refresh summary',
+                         key='summary-' + record['id']):
+                try:
+                    with st.spinner('Reading all pages and validating supporting quotes…'):
+                        service.summarize(owner, project_id, record['id'])
+                    st.rerun()
+                except Exception as exc:
+                    report_error(exc)
+            if record['summary']:
+                saved = record['summary']
+                st.caption('AI summary' if saved['mode'] == 'generated' else 'Source excerpts')
+                if saved.get('warning'):
+                    st.warning(saved['warning'])
+                summary = saved['summary']
+                for field, label in [('research_problem', 'Research problem'), ('methodology', 'Method'),
+                                     ('datasets_and_benchmarks', 'Datasets and experiments'),
+                                     ('key_findings', 'Findings'), ('limitations', 'Limitations')]:
+                    st.markdown(f'**{label}**')
+                    value = summary.get(field)
+                    st.write('\n\n'.join(value) if isinstance(value, list) and value else value or 'Not found in the paper.')
+                    evidence = summary.get('evidence', {}).get(field, [])
+                    if evidence:
+                        with st.expander(f'Sources for {label.lower()}'):
+                            for quote in evidence:
+                                st.text(quote['quote'])
+                                st.caption(f"{record['filename']} · page {quote['page']}")
+                st.download_button('Download summary', json.dumps(saved, indent=2),
+                    file_name=f"summary-{record['id']}.json", mime='application/json', key='export-' + record['id'])

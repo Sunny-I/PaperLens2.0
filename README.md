@@ -1,5 +1,15 @@
 # PaperLens
 
+## Persistent hosted workspace
+
+The default app now uses **Google login, PostgreSQL projects and chat, private
+Cloudflare R2 PDFs, OpenAI embeddings/answers, and project-scoped Pinecone search**.
+See **[SETUP.md](SETUP.md)** for `.env` configuration, startup, deployment, and limits.
+Run `python scripts/run.py` after configuring the credentials.
+
+The documentation below describes the original session-only dashboard, preserved
+as `legacy_app.py`. Run `streamlit run legacy_app.py` to use that mode.
+
 ### OpenAI answers and summaries
 
 Install the dependencies from `requirements.txt`, then configure `OPENAI_API_KEY`

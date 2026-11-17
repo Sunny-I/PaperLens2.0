@@ -1,6 +1,7 @@
 """OpenAI Responses API with typed output, citation checks, and bounded repair."""
 from openai import OpenAI, APIError, APITimeoutError, APIConnectionError
 from pydantic import SecretStr, ValidationError
+from pipeline.output_validation import CitationValidationError, StructuredOutputError
 
 DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
 
@@ -47,6 +48,7 @@ class OpenAIClient:
             with OpenAI(api_key=self.api_key.get_secret_value(), timeout=self.timeout,
                         max_retries=1) as client:
                 for attempt in range(2):
+                    result = None
                     try:
                         response = client.responses.parse(model=model.strip(), input=conversation,
                             text_format=schema, store=False)
@@ -63,12 +65,19 @@ class OpenAIClient:
                         return result
                     except ResponseUnavailable:
                         raise
-                    except (ValidationError, ValueError, TypeError):
+                    except (ValidationError, ValueError, TypeError) as exc:
                         if attempt:
-                            raise ValueError("OpenAI output failed schema or citation validation twice. Showing source excerpts instead.") from None
+                            raise StructuredOutputError('citations' if isinstance(exc, CitationValidationError)
+                                                        else 'schema') from None
+                        # Show the model the rejected answer and exact safe validation feedback.
+                        # Provider exceptions and credential values are never included.
+                        if result is not None:
+                            conversation.append({'role': 'assistant', 'content': result.model_dump_json()})
+                        hint = exc.repair_hint if isinstance(exc, CitationValidationError) else (
+                            'The last response did not match the required output schema.')
                         conversation.append({"role": "user", "content":
                             "Regenerate the complete JSON with all required fields, valid source IDs/pages "
-                            "and exact supporting quotes. Use null or [] for unsupported information."})
+                            "and exact supporting quotes. Use null or [] for unsupported information. " + hint})
         except APIError as exc:
             raise ValueError(safe_error(exc)) from None
         except ValidationError:

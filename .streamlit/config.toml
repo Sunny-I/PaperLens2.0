@@ -3,7 +3,35 @@ gatherUsageStats = false
 
 [server]
 headless = true
-enableCORS = false
-enableXsrfProtection = false
-maxUploadSize = 200
+enableCORS = true
+enableXsrfProtection = true
+maxUploadSize = 20
+
+[theme.light]
+primaryColor = "#5543c4"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f3f8"
+textColor = "#17243b"
+borderColor = "#d7deea"
+
+[theme.light.sidebar]
+backgroundColor = "#f4f6fa"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#17243b"
+primaryColor = "#5543c4"
+borderColor = "#d7deea"
+
+[theme.dark]
+primaryColor = "#b8abff"
+backgroundColor = "#101622"
+secondaryBackgroundColor = "#1c2535"
+textColor = "#f1f4fa"
+borderColor = "#46536a"
+
+[theme.dark.sidebar]
+backgroundColor = "#171f2e"
+secondaryBackgroundColor = "#242f43"
+textColor = "#f1f4fa"
+primaryColor = "#b8abff"
+borderColor = "#53617a"
 

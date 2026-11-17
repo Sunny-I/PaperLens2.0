@@ -48,7 +48,7 @@ class VoyageTests(unittest.TestCase):
     @patch("pipeline.voyage_client.VoyageClient.embed_query", return_value=[1., 0.])
     @patch("pipeline.voyage_client.VoyageClient.embed", return_value=[[1., 0.]])
     def test_independent_providers_and_dropdown_memory(self, embed, query, chat, samples):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         def ctl(kind, label):
             return next(x for x in getattr(app, kind) if x.label == label)
         ctl("selectbox", "Search method for new uploads").select("Semantic embeddings").run()

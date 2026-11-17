@@ -17,7 +17,7 @@ from pipeline.gemini_client import GeminiClient, ProviderEmbeddings
 from pipeline.evaluate import evaluate
 from test_pipeline import pdf, chunk
 
-APP=str(Path(__file__).resolve().parents[1]/'app.py')
+APP=str(Path(__file__).resolve().parents[1]/'legacy_app.py')
 
 def control(app,kind,label):
     return next(c for c in getattr(app,kind) if c.label==label)
@@ -31,7 +31,7 @@ class ConfigurationAuditTests(unittest.TestCase):
         docs.start();self.addCleanup(docs.stop)
 
     def test_provider_models_and_hidden_embedding_survive_switches(self):
-        app=AppTest.from_file(APP).run()
+        app=AppTest.from_file(APP, default_timeout=30).run()
         control(app,'text_input','Chat model').set_value('gemini-explicit-123').run()
         control(app,'selectbox','Search method for new uploads').select('Semantic embeddings').run()
         control(app,'selectbox','Embedding model').set_value('voyage-4').run()
@@ -49,7 +49,7 @@ class ConfigurationAuditTests(unittest.TestCase):
         self.assertEqual(control(app,'text_input','Ollama server URL').value,'http://localhost:11555')
 
     def test_explicit_empty_model_is_not_replaced_after_switch(self):
-        app=AppTest.from_file(APP).run()
+        app=AppTest.from_file(APP, default_timeout=30).run()
         control(app,'text_input','Chat model').set_value('').run()
         control(app,'selectbox','Model provider').select('Ollama').run()
         control(app,'selectbox','Model provider').select('Gemini').run()
@@ -57,7 +57,7 @@ class ConfigurationAuditTests(unittest.TestCase):
 
     def test_threshold_nondefault_and_zero_survive_index_changes(self):
         for value in [0.17,0.0]:
-            app=AppTest.from_file(APP).run()
+            app=AppTest.from_file(APP, default_timeout=30).run()
             control(app,'slider','Minimum cosine similarity').set_value(value).run()
             app.session_state['corpus']=ingest([('a.pdf',pdf('Orion accuracy evidence.'))],embedder=lambda texts:[[1.,0.] for _ in texts])
             app.run()
@@ -69,7 +69,7 @@ class ConfigurationAuditTests(unittest.TestCase):
     def test_actual_ui_to_provider_configuration_and_frozen_index(self,embed,query,generate):
         embed.side_effect=lambda client,texts,model:[[1.,0.,0.,0.] for _ in texts]
         generate.return_value=GeneratedAnswer(claims=[])
-        app=AppTest.from_file(APP).run()
+        app=AppTest.from_file(APP, default_timeout=30).run()
         control(app,'selectbox','Search method for new uploads').select('Semantic embeddings').run()
         control(app,'selectbox','Embedding provider').select('Gemini').run()
         control(app,'selectbox','Embedding model').set_value('gemini-embedding-001')
@@ -92,7 +92,7 @@ class ConfigurationAuditTests(unittest.TestCase):
 
     @patch('pipeline.gemini_client.GeminiClient.structured',autospec=True)
     def test_offline_answer_mode_never_calls_provider(self,generate):
-        app=AppTest.from_file(APP).run()
+        app=AppTest.from_file(APP, default_timeout=30).run()
         control(app,'checkbox','Generate AI answers').uncheck()
         control(app,'button','Try sample papers').click().run()
         control(app,'text_input','Research question').set_value('Orion accuracy')

@@ -17,7 +17,7 @@ class AppTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_simple_defaults_and_empty_selected_scope(self):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         self.assertTrue(next(c for c in app.checkbox if c.label == "Generate AI answers").value)
         self.assertFalse(any(t.label == "Embedding model" for t in app.text_input))
         next(b for b in app.button if b.label == "Try sample papers").click().run()
@@ -29,7 +29,7 @@ class AppTests(unittest.TestCase):
         self.assertTrue(any("Choose at least one paper" in w.value for w in app.warning))
 
     def test_sample_button_removes_old_generated_examples_but_keeps_uploads(self):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         app.session_state["corpus"] = ingest([
             ("Sample_Study_A.pdf", pdf("FICTIONAL EXAMPLE - not a published research paper.\nMethods: Invented data.")),
             ("my-upload.pdf", pdf("My actual paper with independent research content.")),
@@ -52,7 +52,7 @@ class AppTests(unittest.TestCase):
                 "methodology": None, "datasets_and_benchmarks": None, "key_findings": [], "limitations": []}
             return iter([{"message": {"role": "assistant", "content": json.dumps(payload)}, "done": True}])
         chat.side_effect = respond
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         next(s for s in app.selectbox if s.label == "Model provider").select("Ollama").run()
         next(t for t in app.text_input if t.label == "Chat model").set_value("test-model")
         next(c for c in app.checkbox if c.label == "Summarize on upload").check()
@@ -68,7 +68,7 @@ class AppTests(unittest.TestCase):
         self.assertEqual(chat.call_count, self.sample_count + 1)
 
     def test_summary_generation_requires_model(self):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         next(b for b in app.button if b.label == "Try sample papers").click().run()
         next(t for t in app.text_input if t.label == "Chat model").set_value("")
         next(b for b in app.button if b.label == "Summarize this paper").click().run()
@@ -76,7 +76,7 @@ class AppTests(unittest.TestCase):
         self.assertTrue(any("chat model" in e.value for e in app.error))
 
     def test_load_search_rerun_clear(self):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         self.assertFalse(app.exception)
         next(c for c in app.checkbox if c.label == "Generate AI answers").uncheck()
         next(b for b in app.button if b.label == "Try sample papers").click().run()

@@ -48,6 +48,44 @@ class OpenAITests(unittest.TestCase):
         self.assertEqual(result["mode"], "generated")
         self.assertEqual(len(requests), 2)
         self.assertIn("Regenerate", requests[1]["input"][-1]["content"])
+        self.assertIn('Source ID 99 does not exist', requests[1]['input'][-1]['content'])
+        self.assertEqual(requests[1]['input'][-2]['role'], 'assistant')
+
+    def test_bad_quotes_report_citation_stage_and_one_fallback_notice(self):
+        requests = []
+        def handler(request):
+            requests.append(json.loads(request.content))
+            return self.response({'claims': [{'text': 'Uses attention.', 'citations': [
+                {'source_id': 1, 'quote': 'A fabricated quotation that is absent from the source.'}]}]})
+        self.transport(handler)
+        result = AnswerGenerator().answer('Which method?', [chunk('The transformer uses attention layers.')],
+            OpenAIClient('fake-secret'), 'test-model')
+        self.assertEqual(result['failure_stage'], 'citations')
+        self.assertEqual(result['warning'].count('Showing source excerpts instead.'), 1)
+        self.assertIn('one contiguous passage', requests[1]['input'][-1]['content'])
+
+    def test_numbered_evidence_preserves_pdf_accented_text(self):
+        source = 'The paper was written by Tolga ¸Sakar and Hakan Emekci.'
+        self.transport(lambda request: self.response({'claims': [{'text': 'The authors are Tolga Şakar and Hakan Emekci.',
+            'citations': [{'source_id': 1, 'evidence_id': 1}]}]}))
+        result = AnswerGenerator().answer('Who wrote it?', [chunk(source)],
+            OpenAIClient('fake'), 'test', evidence_ids=True)
+        self.assertEqual(result['mode'], 'generated')
+        self.assertEqual(result['claims'][0]['citations'][0]['quote'], source)
+
+    def test_unknown_evidence_id_is_rejected_after_bounded_repair(self):
+        calls = []
+        def handler(request):
+            calls.append(json.loads(request.content))
+            return self.response({'claims': [{'text': 'An unsupported claim.',
+                'citations': [{'source_id': 1, 'evidence_id': 99}]}]})
+        self.transport(handler)
+        result = AnswerGenerator().answer('Who wrote it?', [chunk('This is the actual source passage.')],
+            OpenAIClient('fake'), 'test', evidence_ids=True)
+        self.assertEqual(result['mode'], 'extractive')
+        self.assertEqual(result['failure_stage'], 'citations')
+        self.assertEqual(len(calls), 2)
+        self.assertIn('source_id/evidence_id pairs', calls[1]['input'][-1]['content'])
 
     def test_schema_repair_is_bounded(self):
         calls = []
@@ -103,7 +141,7 @@ class OpenAITests(unittest.TestCase):
     @patch("pipeline.openai_client.OpenAIClient.structured", return_value=GeneratedAnswer(claims=[]))
     @patch("pipeline.demo_papers.load_demo_papers", return_value=[("test.pdf", pdf("The transformer uses attention layers."))])
     def test_app_provider_switch_and_generation(self, samples, generate):
-        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py")).run()
+        app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "legacy_app.py"), default_timeout=30).run()
         def ctl(kind, label):
             return next(x for x in getattr(app, kind) if x.label == label)
         ctl("selectbox", "Model provider").select("OpenAI").run()
